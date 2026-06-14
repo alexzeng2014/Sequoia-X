@@ -53,7 +53,23 @@ def main() -> None:
             # ── 回填模式：单线程保守拉历史 K 线，自动多轮重跑 ──
             logger.info("进入回填模式...")
             all_symbols = engine.get_all_symbols()
-            engine.backfill(all_symbols)
+
+            from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[bold blue]{task.description}"),
+                BarColumn(),
+                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                TimeElapsedColumn(),
+            ) as progress:
+                task_id = progress.add_task("回填历史数据", total=len(all_symbols))
+
+                def _on_progress(current: int, total: int):
+                    progress.update(task_id, completed=current)
+
+                engine.backfill(all_symbols, progress_callback=_on_progress)
+
             logger.info("Sequoia-X V2 回填模式运行完成")
             return
 

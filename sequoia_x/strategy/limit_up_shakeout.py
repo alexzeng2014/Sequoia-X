@@ -46,7 +46,7 @@ class LimitUpShakeoutStrategy(BaseStrategy):
                 today = df.iloc[-1]  # 今日
 
                 # 条件 1：昨日涨停
-                limit_up_yesterday = prev1["close"] >= prev2["close"] * 1.095
+                limit_up_yesterday = prev1["close"] >= prev2["close"] * 1.1
                 # 条件 2：今日收阴
                 bearish_today = today["close"] < today["open"]
                 # 条件 3：今日放量

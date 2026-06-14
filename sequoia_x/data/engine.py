@@ -1,6 +1,8 @@
 """数据引擎模块：负责 SQLite 行情数据存储与 baostock 增量同步。"""
 
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
@@ -31,25 +33,27 @@ CREATE INDEX IF NOT EXISTS idx_symbol_date ON stock_daily (symbol, date);
 """
 
 
-def _bs_fetch_batch(tasks: list) -> list:
-    """多进程 worker：独立 login，批量拉取 baostock 数据。"""
+def _bs_fetch_batch(tasks: list, lock: threading.Lock) -> list:
+    """多线程 worker：通过锁串行化 baostock 调用，批量拉取数据。"""
     import baostock as bs
-    bs.login()
     results = []
     for symbol, bs_code, start, end in tasks:
-        rs = bs.query_history_k_data_plus(
-            bs_code,
-            "date,open,high,low,close,volume,amount",
-            start_date=start,
-            end_date=end,
-            frequency="d",
-            adjustflag="1",  # 后复权
-        )
-        if rs.error_code != "0":
+        try:
+            with lock:
+                rs = bs.query_history_k_data_plus(
+                    bs_code,
+                    "date,open,high,low,close,volume,amount",
+                    start_date=start,
+                    end_date=end,
+                    frequency="d",
+                    adjustflag="3",  # 不复权，真实价格
+                )
+                if rs.error_code != "0":
+                    continue
+                while rs.next():
+                    results.append([symbol] + rs.get_row_data())
+        except Exception:
             continue
-        while rs.next():
-            results.append([symbol] + rs.get_row_data())
-    bs.logout()
     return results
 
 
@@ -59,6 +63,7 @@ class DataEngine:
     def __init__(self, settings: Settings) -> None:
         self.db_path: str = settings.db_path
         self.start_date: str = settings.start_date
+        self._bs_lock = threading.Lock()
         self._init_db()
 
     def _init_db(self) -> None:
@@ -95,9 +100,10 @@ class DataEngine:
     # ── 数据同步 ──
 
     def sync_today_bulk(self) -> int:
-        """多进程并行通过 baostock 拉取增量数据（后复权），写入 SQLite。"""
+        """多线程并行通过 baostock 拉取增量数据（后复权），写入 SQLite。"""
         from datetime import date, timedelta
-        from multiprocessing import Pool
+
+        import baostock as bs
 
         today_str = date.today().strftime("%Y-%m-%d")
 
@@ -123,45 +129,60 @@ class DataEngine:
             logger.info("所有股票已是最新，无需更新")
             return 0
 
-        logger.info(f"需要更新 {len(tasks)} 只股票，启动多进程并行拉取...")
+        logger.info(f"需要更新 {len(tasks)} 只股票，启动多线程并行拉取...")
 
-        n_workers = min(8, len(tasks))
-        chunks = [tasks[i::n_workers] for i in range(n_workers)]
-
-        with Pool(n_workers) as pool:
-            batch_results = pool.map(_bs_fetch_batch, chunks)
-
-        all_rows = []
-        for batch in batch_results:
-            all_rows.extend(batch)
-
-        if not all_rows:
-            logger.info("无新数据（可能非交易日）")
+        lg = bs.login()
+        if lg.error_code != "0":
+            logger.error(f"baostock 登录失败: {lg.error_msg}")
             return 0
 
-        df = pd.DataFrame(all_rows, columns=["symbol", "date", "open", "high", "low", "close", "volume", "turnover"])
-        for col in ["open", "high", "low", "close", "volume", "turnover"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(subset=["close"])
-        df = df[df["volume"] > 0]
+        try:
+            n_workers = min(8, len(tasks))
+            chunks = [tasks[i::n_workers] for i in range(n_workers)]
 
-        count = len(df)
-        with sqlite3.connect(self.db_path) as conn:
-            for d in df["date"].unique().tolist():
-                conn.execute("DELETE FROM stock_daily WHERE date = ?", (d,))
-            df.to_sql("stock_daily", conn, if_exists="append", index=False, method="multi", chunksize=500)
-            conn.commit()
+            all_rows = []
+            with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                futures = [
+                    executor.submit(_bs_fetch_batch, chunk, self._bs_lock)
+                    for chunk in chunks
+                ]
+                for future in as_completed(futures):
+                    batch = future.result()
+                    if batch:
+                        all_rows.extend(batch)
 
-        logger.info(f"sync_today_bulk: 写入 {count} 条数据")
-        return count
+            if not all_rows:
+                logger.info("无新数据（可能非交易日）")
+                return 0
 
-    def backfill(self, symbols: list[str]) -> None:
-        """通过 baostock 批量回填历史日 K 线数据（后复权）。
+            df = pd.DataFrame(all_rows, columns=["symbol", "date", "open", "high", "low", "close", "volume", "turnover"])
+            for col in ["open", "high", "low", "close", "volume", "turnover"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            df = df.dropna(subset=["close"])
+            df = df[df["volume"] > 0]
 
-        容错机制：
-        - 单只股票失败自动重试 3 次，间隔递增（2s/4s/8s）
-        - 每 200 只股票自动重连 baostock（防止长连接超时）
-        - 已入库的自动 skip，中断后可重跑续传
+            count = len(df)
+            with sqlite3.connect(self.db_path) as conn:
+                for d in df["date"].unique().tolist():
+                    conn.execute("DELETE FROM stock_daily WHERE date = ?", (d,))
+                df.to_sql("stock_daily", conn, if_exists="append", index=False, method="multi", chunksize=500)
+                conn.commit()
+
+            logger.info(f"sync_today_bulk: 写入 {count} 条数据")
+            return count
+        finally:
+            bs.logout()
+
+    def backfill(
+        self,
+        symbols: list[str],
+        progress_callback=None,
+    ) -> None:
+        """通过 baostock 批量回填历史日 K 线数据（后复权），多线程并行加速。
+
+        Args:
+            symbols: 股票代码列表。
+            progress_callback: 进度回调，签名为 callback(current: int, total: int)。
         """
         import time
         from datetime import date, timedelta
@@ -170,129 +191,124 @@ class DataEngine:
 
         today_str = date.today().strftime("%Y-%m-%d")
         max_retries = 3
-        reconnect_interval = 200  # 每处理 N 只股票重连一次
 
         def _login():
-            lg = bs.login()
-            if lg.error_code != "0":
-                logger.error(f"baostock 登录失败: {lg.error_msg}")
-                return False
-            return True
+            with self._bs_lock:
+                lg = bs.login()
+                if lg.error_code != "0":
+                    logger.error(f"baostock 登录失败: {lg.error_msg}")
+                    return False
+                return True
 
         if not _login():
             return
 
+        total = len(symbols)
         success = 0
         skipped = 0
         failed = 0
-        since_reconnect = 0
 
-        try:
-            for i, symbol in enumerate(symbols):
-                last_date = self._get_last_date(symbol)
-                if last_date and last_date >= today_str:
-                    skipped += 1
-                    if (i + 1) % 500 == 0:
-                        logger.info(
-                            f"已处理 {i + 1}/{len(symbols)}，"
-                            f"成功 {success} 跳过 {skipped} 失败 {failed}"
-                        )
-                    continue
+        def _fetch_one(symbol: str) -> tuple:
+            """单只股票的 baostock 拉取（在线程中调用，用锁串行化）。"""
+            last_date = self._get_last_date(symbol)
+            if last_date and last_date >= today_str:
+                return ("skip", symbol)
 
-                # 定期重连，防止长连接超时
-                since_reconnect += 1
-                if since_reconnect >= reconnect_interval:
-                    bs.logout()
-                    time.sleep(1)
-                    if not _login():
-                        logger.error("重连失败，终止回填")
-                        return
-                    since_reconnect = 0
+            start = last_date or self.start_date
+            if last_date:
+                start = (date.fromisoformat(last_date) + timedelta(days=1)).strftime("%Y-%m-%d")
 
-                start = last_date or self.start_date
-                if last_date:
-                    start = (date.fromisoformat(last_date) + timedelta(days=1)).strftime("%Y-%m-%d")
+            bs_code = self._to_baostock_code(symbol)
 
-                bs_code = self._to_baostock_code(symbol)
-
-                # 带重试的查询
-                rows = []
-                query_ok = False
-                for attempt in range(max_retries):
-                    try:
+            for attempt in range(max_retries):
+                try:
+                    with self._bs_lock:
                         rs = bs.query_history_k_data_plus(
                             bs_code,
                             "date,open,high,low,close,volume,amount",
                             start_date=start,
                             end_date=today_str,
                             frequency="d",
-                            adjustflag="1",  # 后复权
+                            adjustflag="3",  # 不复权，真实价格
                         )
-
                         if rs.error_code != "0":
                             raise RuntimeError(rs.error_msg)
-
                         rows = []
                         while rs.next():
                             rows.append(rs.get_row_data())
-                        query_ok = True
-                        break
-
-                    except Exception as exc:
-                        if attempt < max_retries - 1:
-                            wait = 2 ** (attempt + 1)
-                            logger.warning(
-                                f"[{symbol}] 第{attempt + 1}次失败: {exc}，{wait}s 后重试"
-                            )
-                            time.sleep(wait)
-                            # 重连 baostock
+                    return ("ok", symbol, rows)
+                except Exception as exc:
+                    if attempt < max_retries - 1:
+                        wait = 2 ** (attempt + 1)
+                        logger.warning(f"[{symbol}] 第{attempt + 1}次失败: {exc}，{wait}s 后重试")
+                        time.sleep(wait)
+                        with self._bs_lock:
                             bs.logout()
-                            time.sleep(1)
-                            _login()
-                        else:
-                            logger.warning(f"[{symbol}] {max_retries}次重试均失败，跳过")
+                        time.sleep(1)
+                        _login()
+                    else:
+                        logger.warning(f"[{symbol}] {max_retries}次重试均失败，跳过")
+            return ("fail", symbol)
 
-                if not query_ok:
-                    failed += 1
-                    continue
+        try:
+            n_workers = min(8, total)
+            completed = 0
 
-                if not rows:
-                    skipped += 1
-                    continue
+            with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                futures = {executor.submit(_fetch_one, s): s for s in symbols}
+                for future in as_completed(futures):
+                    result = future.result()
+                    completed += 1
 
-                df = pd.DataFrame(rows, columns=rs.fields)
-                for col in ["open", "high", "low", "close", "volume", "amount"]:
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-                df = df.dropna(subset=["close"])
-                df = df[df["volume"] > 0]
+                    if progress_callback:
+                        progress_callback(completed, total)
 
-                if df.empty:
-                    skipped += 1
-                    continue
+                    if result[0] == "skip":
+                        skipped += 1
+                        continue
+                    elif result[0] == "fail":
+                        failed += 1
+                        continue
 
-                df["symbol"] = symbol
-                df = df.rename(columns={"amount": "turnover"})
-                df = df[["symbol", "date", "open", "high", "low", "close", "volume", "turnover"]]
+                    _, symbol, rows = result
+                    if not rows:
+                        skipped += 1
+                        continue
 
-                try:
-                    with sqlite3.connect(self.db_path) as conn:
-                        df.to_sql(
-                            "stock_daily", conn, if_exists="append",
-                            index=False, method="multi", chunksize=500,
+                    df = pd.DataFrame(rows, columns=["date", "open", "high", "low", "close", "volume", "amount"])
+                    for col in ["open", "high", "low", "close", "volume", "amount"]:
+                        df[col] = pd.to_numeric(df[col], errors="coerce")
+                    df = df.dropna(subset=["close"])
+                    df = df[df["volume"] > 0]
+
+                    if df.empty:
+                        skipped += 1
+                        continue
+
+                    df["symbol"] = symbol
+                    df = df.rename(columns={"amount": "turnover"})
+                    df = df[["symbol", "date", "open", "high", "low", "close", "volume", "turnover"]]
+
+                    try:
+                        with sqlite3.connect(self.db_path) as conn:
+                            df.to_sql(
+                                "stock_daily", conn, if_exists="append",
+                                index=False, method="multi", chunksize=500,
+                            )
+                    except sqlite3.IntegrityError:
+                        pass
+
+                    success += 1
+
+                    if completed % 500 == 0:
+                        logger.info(
+                            f"已处理 {completed}/{total}，"
+                            f"成功 {success} 跳过 {skipped} 失败 {failed}"
                         )
-                except sqlite3.IntegrityError:
-                    pass
-
-                success += 1
-
-                if (i + 1) % 500 == 0:
-                    logger.info(
-                        f"已处理 {i + 1}/{len(symbols)}，"
-                        f"成功 {success} 跳过 {skipped} 失败 {failed}"
-                    )
 
         finally:
-            bs.logout()
+            with self._bs_lock:
+                bs.logout()
 
         logger.info(f"回填完成 — 成功: {success} | 跳过: {skipped} | 失败: {failed}")
 
