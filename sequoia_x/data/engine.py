@@ -97,6 +97,78 @@ class DataEngine:
         prefix = "sh" if symbol.startswith(("6", "9")) else "sz"
         return f"{prefix}.{symbol}"
 
+    @staticmethod
+    def _to_tencent_code(symbol: str) -> str:
+        """将纯数字代码转为腾讯行情格式：6/9开头 -> sh，其余 -> sz（无点）。"""
+        prefix = "sh" if symbol.startswith(("6", "9")) else "sz"
+        return f"{prefix}{symbol}"
+
+    # ── 实时行情（腾讯财经）──
+
+    def fetch_realtime_quotes(self, symbols: list[str]) -> dict:
+        """单线程、单次请求批量拉取腾讯财经实时行情。
+
+        腾讯接口 q= 支持一次拼接多只代码，单次即可取回全部，
+        无需 ThreadPoolExecutor 并发（与 main.py 中 baostock 单连接拉取方式一致）。
+
+        Args:
+            symbols: 纯数字股票代码列表。
+
+        Returns:
+            {symbol: {"close": float, "prev_close": float, "pct": float,
+                      "turnover": float, "name": str}} 字典。
+            解析失败或无数据的代码不会出现在结果中。
+        """
+        import re
+
+        import requests
+
+        if not symbols:
+            return {}
+
+        # 腾讯单次请求建议 ≤100 只，按 100 切片逐次请求（仍为单线程串行）。
+        BATCH = 100
+        results: dict = {}
+        url = "http://qt.gtimg.cn/q="
+        pattern = re.compile(r'v_(sh|sz)(\d+)="([^"]*)"')
+
+        for i in range(0, len(symbols), BATCH):
+            chunk = symbols[i:i + BATCH]
+            codes = ",".join(self._to_tencent_code(s) for s in chunk)
+            try:
+                resp = requests.get(url + codes, timeout=10)
+                # 腾讯接口返回 GBK 编码
+                resp.encoding = "gbk"
+                text = resp.text
+            except Exception as exc:
+                logger.warning(f"腾讯实时行情拉取失败（第{i // BATCH + 1}批）: {exc}")
+                continue
+
+            for m in pattern.finditer(text):
+                sym = m.group(2)
+                fields = m.group(3).split("~")
+                try:
+                    name = fields[1]
+                    close = float(fields[3])
+                    prev_close = float(fields[4])
+                    # 成交额：字段索引 37（单位：万元），部分个股可能为空
+                    turnover = 0.0
+                    if len(fields) > 37 and fields[37]:
+                        turnover = float(fields[37]) * 10000  # 转为元
+                    pct = (close - prev_close) / prev_close * 100 if prev_close else 0.0
+                    results[sym] = {
+                        "close": close,
+                        "prev_close": prev_close,
+                        "pct": pct,
+                        "turnover": turnover,
+                        "name": name,
+                    }
+                except (IndexError, ValueError):
+                    continue
+
+        logger.info(f"腾讯实时行情拉取完成：请求 {len(symbols)} 只，返回 {len(results)} 只")
+        return results
+
     # ── 数据同步 ──
 
     def sync_today_bulk(self) -> int:
